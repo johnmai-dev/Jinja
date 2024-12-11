@@ -50,6 +50,8 @@ enum TokenType: String {
     case and = "And"
     case or = "Or"
     case not = "Not"
+    case macro = "Macro"
+    case endMacro = "EndMacro"
 }
 
 struct Token: Equatable {
@@ -70,6 +72,8 @@ let keywords: [String: TokenType] = [
     "and": .and,
     "or": .or,
     "not": .not,
+    "macro": .macro,
+    "endmacro": .endMacro,
     // Literals
     "true": .booleanLiteral,
     "false": .booleanLiteral,
@@ -81,7 +85,7 @@ func isWord(char: String) -> Bool {
 }
 
 func isInteger(char: String) -> Bool {
-    char.range(of: #"[0-9]"#, options: .regularExpression) != nil
+    char.range(of: #"^[0-9]+$"#, options: .regularExpression) != nil
 }
 
 func isWhile(char: String) -> Bool {
@@ -136,21 +140,16 @@ struct PreprocessOptions {
 
 func preprocess(template: String, options: PreprocessOptions = PreprocessOptions()) -> String {
     var template = template
-
     if template.hasSuffix("\n") {
         template.removeLast()
     }
-
     template = template.replacing(#/{#.*?#}/#, with: "{##}")
-
     if options.lstripBlocks == true {
         template = template.replacing(#/(?m)^[ \t]*({[#%])/#, with: { $0.output.1 })
     }
-
     if options.trimBlocks == true {
         template = template.replacing(#/([#%]})\n/#, with: { $0.output.1 })
     }
-
     return
         template
         .replacing(#/{##}/#, with: "")
@@ -163,7 +162,6 @@ func preprocess(template: String, options: PreprocessOptions = PreprocessOptions
 func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()) throws -> [Token] {
     var tokens: [Token] = []
     let src = preprocess(template: source, options: options)
-
     var cursorPosition = 0
 
     @discardableResult
@@ -175,17 +173,14 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
                 if cursorPosition >= src.count {
                     throw JinjaError.syntax("Unexpected end of input")
                 }
-
                 let escaped = String(src[cursorPosition])
                 cursorPosition += 1
-
                 guard let unescaped = escapeCharacters[escaped] else {
                     throw JinjaError.syntax("Unexpected escaped character: \(escaped)")
                 }
                 str.append(unescaped)
                 continue
             }
-
             str.append(String(src[cursorPosition]))
             cursorPosition += 1
             if cursorPosition >= src.count {
@@ -197,7 +192,6 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
 
     main: while cursorPosition < src.count {
         let lastTokenType = tokens.last?.type
-
         if lastTokenType == nil || lastTokenType == .closeStatement || lastTokenType == .closeExpression {
             var text = ""
 
@@ -213,18 +207,13 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
                 continue
             }
         }
-
         try consumeWhile(predicate: isWhile)
-
         let char = String(src[cursorPosition])
-
         if char == "-" || char == "+" {
             let lastTokenType = tokens.last?.type
-
             if lastTokenType == .text || lastTokenType == nil {
                 throw JinjaError.syntax("Unexpected character: \(char)")
             }
-
             switch lastTokenType {
             case .identifier,
                 .numericLiteral,
@@ -234,18 +223,13 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
                 .closeParen,
                 .closeSquareBracket:
                 break
-
             default:
                 cursorPosition += 1
-
                 let num = try consumeWhile(predicate: isInteger)
-
                 tokens.append(Token(value: "\(char)\(num)", type: num.isEmpty ? .unaryOperator : .numericLiteral))
-
                 continue
             }
         }
-
         for (char, token) in orderedMappingTable {
             let slice = src.slice(start: cursorPosition, end: cursorPosition + char.count)
             if slice == char {
@@ -254,7 +238,6 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
                 continue main
             }
         }
-
         if char == "'" || char == "\"" {
             cursorPosition += 1
             let str = try consumeWhile { str in
@@ -264,30 +247,23 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
             cursorPosition += 1
             continue
         }
-
         if isInteger(char: char) {
             let num = try consumeWhile(predicate: isInteger)
             tokens.append(Token(value: num, type: .numericLiteral))
             continue
         }
-
         if isWord(char: char) {
             let word = try consumeWhile(predicate: isWord)
-
             let type: TokenType = keywords.contains(where: { $0.key == word }) ? keywords[word]! : .identifier
-
             if type == .in, tokens.last?.type == .not {
                 _ = tokens.popLast()
                 tokens.append(Token(value: "not in", type: .notIn))
             } else {
                 tokens.append(Token(value: word, type: type))
             }
-
             continue
         }
-
         throw JinjaError.syntax("Unexpected character: \(char)")
     }
-
     return tokens
 }

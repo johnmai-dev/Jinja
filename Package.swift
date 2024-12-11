@@ -13,17 +13,25 @@ let package = Package(
             targets: ["Jinja"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.4")
+    ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "Jinja",
+            dependencies: [
+                .product(name: "OrderedCollections", package: "swift-collections")
+            ],
             path: "Sources",
             swiftSettings: [.enableUpcomingFeature("BareSlashRegexLiterals")]
         ),
         .testTarget(
             name: "JinjaTests",
-            dependencies: ["Jinja"],
+            dependencies: [
+                "Jinja"
+            ],
             path: "Tests",
             swiftSettings: [.enableUpcomingFeature("BareSlashRegexLiterals")]
         ),

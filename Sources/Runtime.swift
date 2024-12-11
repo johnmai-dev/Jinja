@@ -6,11 +6,12 @@
 //
 
 import Foundation
+import OrderedCollections
 
 protocol RuntimeValue {
-    associatedtype T
-    var value: T { get set }
+    associatedtype ValueType
 
+    var value: ValueType { get }
     var builtins: [String: any RuntimeValue] { get set }
 
     func bool() -> Bool
@@ -21,7 +22,12 @@ struct NumericValue: RuntimeValue {
     var builtins: [String: any RuntimeValue] = [:]
 
     func bool() -> Bool {
-        self.value as? Int != 0
+        if let intValue = self.value as? Int {
+            return intValue != 0
+        } else if let doubleValue = self.value as? Double {
+            return doubleValue != 0.0
+        }
+        return false
     }
 }
 
@@ -35,7 +41,7 @@ struct BooleanValue: RuntimeValue {
 }
 
 struct NullValue: RuntimeValue {
-    var value: (any RuntimeValue)?
+    let value: Any? = nil
     var builtins: [String: any RuntimeValue] = [:]
 
     func bool() -> Bool {
@@ -44,7 +50,7 @@ struct NullValue: RuntimeValue {
 }
 
 struct UndefinedValue: RuntimeValue {
-    var value: (any RuntimeValue)?
+    let value: Any? = nil
     var builtins: [String: any RuntimeValue] = [:]
 
     func bool() -> Bool {
@@ -64,56 +70,85 @@ struct ArrayValue: RuntimeValue {
     }
 
     func bool() -> Bool {
-        !self.value.isEmpty
+        return !self.value.isEmpty
     }
 }
 
 struct TupleValue: RuntimeValue {
-    var value: ArrayValue
+    var value: [any RuntimeValue]
     var builtins: [String: any RuntimeValue] = [:]
 
-    func bool() -> Bool {
-        self.value.bool()
-    }
-}
-
-struct ObjectValue: RuntimeValue {
-    var value: [String: any RuntimeValue]
-    var builtins: [String: any RuntimeValue] = [:]
-
-    init(value: [String: any RuntimeValue]) {
+    init(value: [any RuntimeValue]) {
         self.value = value
-        self.builtins = [
-            "get": FunctionValue(value: { args, _ in
-                if let key = args[0] as? StringValue {
-                    if let value = value.first(where: { $0.0 == key.value }) {
-                        return value as! (any RuntimeValue)
-                    } else if args.count > 1 {
-                        return args[1]
-                    } else {
-                        return NullValue()
-                    }
-                } else {
-                    throw JinjaError.runtime("Object key must be a string: got \(type(of:args[0]))")
-                }
-            }),
-            "items": FunctionValue(value: { _, _ in
-                var items: [ArrayValue] = []
-                for (k, v) in value {
-                    items.append(
-                        ArrayValue(value: [
-                            StringValue(value: k),
-                            v,
-                        ])
-                    )
-                }
-                return items as! (any RuntimeValue)
-            }),
-        ]
+        self.builtins["length"] = FunctionValue(value: { _, _ in
+            NumericValue(value: value.count)
+        })
     }
 
     func bool() -> Bool {
         !self.value.isEmpty
+    }
+}
+
+struct ObjectValue: RuntimeValue, Sequence {
+    var storage: OrderedDictionary<String, any RuntimeValue>
+    var builtins: [String: any RuntimeValue]
+
+    var value: [String: any RuntimeValue] { Dictionary(uniqueKeysWithValues: storage.map { ($0, $1) }) }
+    var orderedKeys: [String] { Array(storage.keys) }
+
+    init(value: [String: any RuntimeValue], keyOrder: [String]? = nil) {
+        // If keyOrder is provided, use it; otherwise, maintain the original order from the dictionary
+        let orderedKeys = keyOrder ?? Array(value.keys)
+        let orderedPairs = orderedKeys.compactMap { key in
+            value[key].map { (key, $0) }
+        }
+
+        // Recursively create OrderedDictionary for nested objects
+        let processedPairs = orderedPairs.map { key, value -> (String, any RuntimeValue) in
+            if let objectValue = value as? ObjectValue {
+                // Already an ObjectValue, use it directly
+                return (key, objectValue)
+            } else if let dictValue = value.value as? [String: any RuntimeValue] {
+                // If the value contains a dictionary, convert it to ObjectValue
+                return (key, ObjectValue(value: dictValue))
+            }
+            return (key, value)
+        }
+
+        self.storage = OrderedDictionary(uniqueKeysWithValues: processedPairs)
+        self.builtins = [
+            "get": FunctionValue(value: { args, _ in
+                guard let key = args[0] as? StringValue else {
+                    throw JinjaError.runtime("Object key must be a string: got \(type(of: args[0]))")
+                }
+                if let value = value[key.value] {
+                    return value
+                } else if args.count > 1 {
+                    return args[1]
+                }
+                return NullValue()
+            }),
+            "items": FunctionValue(value: { _, _ in
+                ArrayValue(
+                    value: orderedPairs.map { key, value in
+                        ArrayValue(value: [StringValue(value: key), value])
+                    }
+                )
+            }),
+        ]
+    }
+
+    mutating func setValue(key: String, value: any RuntimeValue) {
+        storage[key] = value
+    }
+
+    func bool() -> Bool {
+        !storage.isEmpty
+    }
+
+    func makeIterator() -> OrderedDictionary<String, any RuntimeValue>.Iterator {
+        return storage.makeIterator()
     }
 }
 
@@ -136,21 +171,23 @@ struct StringValue: RuntimeValue {
             "upper": FunctionValue(value: { _, _ in
                 StringValue(value: value.uppercased())
             }),
-
             "lower": FunctionValue(value: { _, _ in
                 StringValue(value: value.lowercased())
             }),
-
             "strip": FunctionValue(value: { _, _ in
                 StringValue(value: value.trimmingCharacters(in: .whitespacesAndNewlines))
             }),
-
             "title": FunctionValue(value: { _, _ in
-                StringValue(value: value.capitalized)
+                StringValue(value: value.titleCase())
             }),
-
             "length": FunctionValue(value: { _, _ in
                 NumericValue(value: value.count)
+            }),
+            "rstrip": FunctionValue(value: { _, _ in
+                StringValue(value: value.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression))
+            }),
+            "lstrip": FunctionValue(value: { _, _ in
+                StringValue(value: value.replacingOccurrences(of: "^\\s+", with: "", options: .regularExpression))
             }),
         ]
     }
@@ -175,23 +212,24 @@ struct Interpreter {
         var result = ""
         for statement in statements {
             let lastEvaluated = try self.evaluate(statement: statement, environment: environment)
-
             if !(lastEvaluated is NullValue), !(lastEvaluated is UndefinedValue) {
-                if let value = lastEvaluated.value as? String {
-                    result += value
+                if let stringValue = lastEvaluated as? StringValue {
+                    result += stringValue.value
+                } else if let numericValue = lastEvaluated as? NumericValue {
+                    result += String(describing: numericValue.value)
+                } else if let booleanValue = lastEvaluated as? BooleanValue {
+                    result += String(booleanValue.value)
+                } else if let arrayValue = lastEvaluated as? ArrayValue {
+                    // Convert array to JSON string
+                    result += try toJSON(arrayValue)
+                } else if let objectValue = lastEvaluated as? ObjectValue {
+                    // Convert object to JSON string
+                    result += try toJSON(objectValue)
                 } else {
-                    switch lastEvaluated.value {
-                    case let value as Int:
-                        result += String(value)
-                    case let value as String:
-                        result += value
-                    default:
-                        throw JinjaError.runtime("Unknown value type:\(type(of: lastEvaluated.value))")
-                    }
+                    throw JinjaError.runtime("Cannot convert to string: \(type(of: lastEvaluated))")
                 }
             }
         }
-
         return StringValue(value: result)
     }
 
@@ -206,229 +244,543 @@ struct Interpreter {
             try environment.setVariable(name: variableName, value: rhs)
         } else if let member = node.assignee as? MemberExpression {
             let object = try self.evaluate(statement: member.object, environment: environment)
-
-            if var object = object as? ObjectValue {
-                if let property = member.property as? Identifier {
-                    object.value[property.value] = rhs
-                } else {
-                    throw JinjaError.runtime("Cannot assign to member with non-identifier property")
-                }
-            } else {
+            guard var objectValue = object as? ObjectValue else {
                 throw JinjaError.runtime("Cannot assign to member of non-object")
             }
+            guard let property = member.property as? Identifier else {
+                throw JinjaError.runtime("Cannot assign to member with non-identifier property")
+            }
+            // Modify the copy
+            objectValue.setValue(key: property.value, value: rhs)
+            // Update the environment with the modified copy
+            if let parentIdentifier = member.object as? Identifier {
+                try environment.setVariable(name: parentIdentifier.value, value: objectValue)
+            } else {
+                throw JinjaError.runtime("Cannot assign to computed member expression")
+            }
         } else {
-            throw JinjaError.runtime("Invalid assignee type: \(type(of: node.assignee))")
+            throw JinjaError.runtime("Invalid LHS inside assignment expression: \(node.assignee)")
         }
-
         return NullValue()
     }
 
     func evaluateIf(node: If, environment: Environment) throws -> StringValue {
         let test = try self.evaluate(statement: node.test, environment: environment)
-
         return try self.evaluateBlock(statements: test.bool() ? node.body : node.alternate, environment: environment)
     }
 
     func evaluateIdentifier(node: Identifier, environment: Environment) throws -> any RuntimeValue {
-        environment.lookupVariable(name: node.value)
+        let value = environment.lookupVariable(name: node.value)
+        return value
     }
 
-    func evaluateFor(node: For, environment: Environment) throws -> any RuntimeValue {
+    func evaluateFor(node: For, environment: Environment) throws -> StringValue {
+        // Scope for the for loop
         let scope = Environment(parent: environment)
-
-        let iterable = try self.evaluate(statement: node.iterable, environment: scope)
-        var result = ""
-        if let iterable = iterable as? ArrayValue {
-            for i in 0 ..< iterable.value.count {
-                let loop: [String: any RuntimeValue] = [
-                    "index": NumericValue(value: i + 1),
-                    "index0": NumericValue(value: i),
-                    "revindex": NumericValue(value: iterable.value.count - i),
-                    "revindex0": NumericValue(value: iterable.value.count - i - 1),
-                    "first": BooleanValue(value: i == 0),
-                    "last": BooleanValue(value: i == iterable.value.count - 1),
-                    "length": NumericValue(value: iterable.value.count),
-                    "previtem": i > 0 ? iterable.value[i - 1] : UndefinedValue(),
-                    "nextitem": i < iterable.value.count - 1 ? iterable.value[i + 1] : UndefinedValue(),
-                ]
-
-                try scope.setVariable(name: "loop", value: ObjectValue(value: loop))
-
-                let current = iterable.value[i]
-
+        let test: Expression?
+        let iterable: any RuntimeValue
+        if let selectExpression = node.iterable as? SelectExpression {
+            iterable = try self.evaluate(statement: selectExpression.iterable, environment: scope)
+            test = selectExpression.test
+        } else {
+            iterable = try self.evaluate(statement: node.iterable, environment: scope)
+            test = nil
+        }
+        var items: [any RuntimeValue] = []
+        var scopeUpdateFunctions: [(Environment) throws -> Void] = []
+        // Keep track of the indices of the original iterable that passed the test
+        var filteredIndices: [Int] = []
+        var originalIndex = 0
+        // Handle ArrayValue
+        if let arrayIterable = iterable as? ArrayValue {
+            for current in arrayIterable.value {
+                let loopScope = Environment(parent: scope)
+                var scopeUpdateFunction: (Environment) throws -> Void
                 if let identifier = node.loopvar as? Identifier {
-                    try scope.setVariable(name: identifier.value, value: current)
-                } else {
-                }
-
-                switch node.loopvar {
-                case let identifier as Identifier:
-                    try scope.setVariable(name: identifier.value, value: current)
-                case let tupleLiteral as TupleLiteral:
-                    if let current = current as? ArrayValue {
-                        if tupleLiteral.value.count != current.value.count {
-                            throw JinjaError.runtime(
-                                "Too \(tupleLiteral.value.count > current.value.count ? "few" : "many") items to unpack"
-                            )
-                        }
-
-                        for j in 0 ..< tupleLiteral.value.count {
-                            if let identifier = tupleLiteral.value[j] as? Identifier {
-                                try scope.setVariable(name: identifier.value, value: current.value[j])
-                            } else {
-                                throw JinjaError.runtime(
-                                    "Cannot unpack non-identifier type: \(type(of:tupleLiteral.value[j]))"
-                                )
-                            }
-                        }
-                    } else {
-                        throw JinjaError.runtime("Cannot unpack non-iterable type: \(type(of:current))")
+                    scopeUpdateFunction = { scope in
+                        try scope.setVariable(name: identifier.value, value: current)
                     }
-                default:
-                    throw JinjaError.syntaxNotSupported(String(describing: node.loopvar))
+                } else if let tupleLiteral = node.loopvar as? TupleLiteral {
+                    guard let currentArray = current as? ArrayValue else {
+                        throw JinjaError.runtime("Cannot unpack non-iterable type: \(type(of: current))")
+                    }
+                    if tupleLiteral.value.count != currentArray.value.count {
+                        throw JinjaError.runtime(
+                            "Too \(tupleLiteral.value.count > currentArray.value.count ? "few" : "many") items to unpack"
+                        )
+                    }
+                    scopeUpdateFunction = { scope in
+                        for (i, value) in tupleLiteral.value.enumerated() {
+                            guard let identifier = value as? Identifier else {
+                                throw JinjaError.runtime("Cannot unpack non-identifier type: \(type(of: value))")
+                            }
+                            try scope.setVariable(name: identifier.value, value: currentArray.value[i])
+                        }
+                    }
+                } else {
+                    throw JinjaError.runtime("Invalid loop variable(s): \(type(of: node.loopvar))")
                 }
-
-                let evaluated = try self.evaluateBlock(statements: node.body, environment: scope)
-                result += evaluated.value
+                // Evaluate the test before adding the item
+                if let test = test {
+                    try scopeUpdateFunction(loopScope)
+                    let testValue = try self.evaluate(statement: test, environment: loopScope)
+                    if !testValue.bool() {
+                        originalIndex += 1
+                        continue
+                    }
+                }
+                items.append(current)
+                scopeUpdateFunctions.append(scopeUpdateFunction)
+                filteredIndices.append(originalIndex)
+                originalIndex += 1
+            }
+            // Handle StringValue as a special case
+        } else if let stringIterable = iterable as? StringValue {
+            // Treat the string as an iterable of characters
+            for char in stringIterable.value {
+                let current = StringValue(value: String(char))
+                let loopScope = Environment(parent: scope)
+                var scopeUpdateFunction: (Environment) throws -> Void
+                if let identifier = node.loopvar as? Identifier {
+                    scopeUpdateFunction = { scope in
+                        try scope.setVariable(name: identifier.value, value: current)
+                    }
+                } else {
+                    throw JinjaError.runtime("Invalid loop variable(s): \(type(of: node.loopvar))")
+                }
+                // Evaluate the test before adding the item
+                if let test = test {
+                    try scopeUpdateFunction(loopScope)
+                    let testValue = try self.evaluate(statement: test, environment: loopScope)
+                    if !testValue.bool() {
+                        originalIndex += 1
+                        continue
+                    }
+                }
+                items.append(current)
+                scopeUpdateFunctions.append(scopeUpdateFunction)
+                filteredIndices.append(originalIndex)
+                originalIndex += 1
+            }
+            // Handle ObjectValue (dictionary)
+        } else if let objectIterable = iterable as? ObjectValue {
+            // Treat the dictionary as an iterable of key-value pairs
+            for (key, value) in objectIterable {
+                let current = ArrayValue(value: [StringValue(value: key), value])
+                let loopScope = Environment(parent: scope)
+                var scopeUpdateFunction: (Environment) throws -> Void
+                if let identifier = node.loopvar as? Identifier {
+                    scopeUpdateFunction = { scope in
+                        try scope.setVariable(name: identifier.value, value: current)
+                    }
+                } else if let tupleLiteral = node.loopvar as? TupleLiteral {
+                    // Support unpacking of key-value pairs into two variables
+                    if tupleLiteral.value.count != 2 {
+                        throw JinjaError.runtime(
+                            "Cannot unpack dictionary entry: expected 2 variables, got \(tupleLiteral.value.count)"
+                        )
+                    }
+                    guard let keyIdentifier = tupleLiteral.value[0] as? Identifier else {
+                        throw JinjaError.runtime(
+                            "Cannot unpack dictionary entry into non-identifier: \(type(of: tupleLiteral.value[0]))"
+                        )
+                    }
+                    guard let valueIdentifier = tupleLiteral.value[1] as? Identifier else {
+                        throw JinjaError.runtime(
+                            "Cannot unpack dictionary entry into non-identifier: \(type(of: tupleLiteral.value[1]))"
+                        )
+                    }
+                    scopeUpdateFunction = { scope in
+                        try scope.setVariable(name: keyIdentifier.value, value: StringValue(value: key))
+                        try scope.setVariable(name: valueIdentifier.value, value: value)
+                    }
+                } else {
+                    throw JinjaError.runtime("Invalid loop variable(s): \(type(of: node.loopvar))")
+                }
+                // Evaluate the test before adding the item
+                if let test = test {
+                    try scopeUpdateFunction(loopScope)
+                    let testValue = try self.evaluate(statement: test, environment: loopScope)
+                    if !testValue.bool() {
+                        originalIndex += 1
+                        continue
+                    }
+                }
+                items.append(current)
+                scopeUpdateFunctions.append(scopeUpdateFunction)
+                filteredIndices.append(originalIndex)
+                originalIndex += 1
             }
         } else {
-            throw JinjaError.runtime("Expected iterable type in for loop: got \(type(of:iterable))")
+            throw JinjaError.runtime("Expected iterable type in for loop: got \(type(of: iterable))")
         }
-
+        var result = ""
+        var noIteration = true
+        for i in 0 ..< items.count {
+            // Get the previous and next items that passed the filter
+            let previousIndex = filteredIndices.firstIndex(of: filteredIndices[i])! - 1
+            let nextIndex = filteredIndices.firstIndex(of: filteredIndices[i])! + 1
+            let previtem: any RuntimeValue
+            if previousIndex >= 0 {
+                let previousFilteredIndex = filteredIndices[previousIndex]
+                if let arrayIterable = iterable as? ArrayValue {
+                    previtem = arrayIterable.value[previousFilteredIndex]
+                } else if let stringIterable = iterable as? StringValue {
+                    let index = stringIterable.value.index(
+                        stringIterable.value.startIndex,
+                        offsetBy: previousFilteredIndex
+                    )
+                    previtem = StringValue(value: String(stringIterable.value[index]))
+                } else if let objectIterable = iterable as? ObjectValue {
+                    let (key, value) = objectIterable.storage.elements[previousFilteredIndex]
+                    previtem = ArrayValue(value: [StringValue(value: key), value])
+                } else {
+                    previtem = UndefinedValue()
+                }
+            } else {
+                previtem = UndefinedValue()
+            }
+            let nextitem: any RuntimeValue
+            if nextIndex < filteredIndices.count {
+                let nextFilteredIndex = filteredIndices[nextIndex]
+                if let arrayIterable = iterable as? ArrayValue {
+                    nextitem = arrayIterable.value[nextFilteredIndex]
+                } else if let stringIterable = iterable as? StringValue {
+                    let index = stringIterable.value.index(stringIterable.value.startIndex, offsetBy: nextFilteredIndex)
+                    nextitem = StringValue(value: String(stringIterable.value[index]))
+                } else if let objectIterable = iterable as? ObjectValue {
+                    let (key, value) = objectIterable.storage.elements[nextFilteredIndex]
+                    nextitem = ArrayValue(value: [StringValue(value: key), value])
+                } else {
+                    nextitem = UndefinedValue()
+                }
+            } else {
+                nextitem = UndefinedValue()
+            }
+            let loop: [String: any RuntimeValue] = [
+                "index": NumericValue(value: i + 1),
+                "index0": NumericValue(value: i),
+                "revindex": NumericValue(value: items.count - i),
+                "revindex0": NumericValue(value: items.count - i - 1),
+                "first": BooleanValue(value: i == 0),
+                "last": BooleanValue(value: i == items.count - 1),
+                "length": NumericValue(value: items.count),
+                "previtem": previtem,
+                "nextitem": nextitem,
+            ]
+            try scope.setVariable(name: "loop", value: ObjectValue(value: loop))
+            try scopeUpdateFunctions[i](scope)
+            let evaluated = try self.evaluateBlock(statements: node.body, environment: scope)
+            result += evaluated.value
+            noIteration = false
+        }
+        if noIteration {
+            let defaultEvaluated = try self.evaluateBlock(statements: node.defaultBlock, environment: scope)
+            result += defaultEvaluated.value
+        }
         return StringValue(value: result)
     }
 
     func evaluateBinaryExpression(node: BinaryExpression, environment: Environment) throws -> any RuntimeValue {
         let left = try self.evaluate(statement: node.left, environment: environment)
-
-        if node.operation.value == "and" {
-            return left.bool() ? try self.evaluate(statement: node.right, environment: environment) : left
-        } else if node.operation.value == "or" {
-            return left.bool() ? left : try self.evaluate(statement: node.right, environment: environment)
-        }
-
         let right = try self.evaluate(statement: node.right, environment: environment)
-
-        if node.operation.value == "==" {
-            switch left.value {
-            case let value as String:
-                return BooleanValue(value: value == right.value as! String)
-            case let value as Int:
-                return BooleanValue(value: value == right.value as! Int)
-            case let value as Bool:
-                return BooleanValue(value: value == right.value as! Bool)
-            default:
-                throw JinjaError.runtime(
-                    "Unknown left value type:\(type(of: left.value)), right value type:\(type(of: right.value))"
-                )
+        // Handle 'or'
+        if node.operation.value == "or" {
+            if left.bool() {
+                return left
+            } else {
+                return right
             }
-        } else if node.operation.value == "!=" {
-            if type(of: left) != type(of: right) {
+        }
+        // Handle 'and'
+        if node.operation.value == "and" {
+            if !left.bool() {
+                return left
+            } else {
+                return right
+            }
+        }
+        // ==
+        if node.operation.value == "==" {
+            // Handle array indexing for right operand
+            if let memberExpr = node.right as? MemberExpression,
+                let arrayValue = try self.evaluate(statement: memberExpr.object, environment: environment)
+                    as? ArrayValue,
+                let indexExpr = memberExpr.property as? NumericLiteral,
+                let index = indexExpr.value as? Int
+            {
+
+                // Handle negative indices
+                let actualIndex = index < 0 ? arrayValue.value.count + index : index
+                if actualIndex >= 0 && actualIndex < arrayValue.value.count {
+                    let rightValue = arrayValue.value[actualIndex]
+                    return BooleanValue(value: try areEqual(left, rightValue))
+                }
+            }
+
+            return BooleanValue(value: try areEqual(left, right))
+        }
+        // !=
+        if node.operation.value == "!=" {
+            if let left = left as? StringValue, let right = right as? StringValue {
+                return BooleanValue(value: left.value != right.value)
+            } else if let left = left as? NumericValue, let right = right as? NumericValue {
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftInt != rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: leftDouble != rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: Double(leftInt) != rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftDouble != Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for inequality comparison")
+                }
+            } else if let left = left as? BooleanValue, let right = right as? BooleanValue {
+                return BooleanValue(value: left.value != right.value)
+            } else if left is NullValue, right is NullValue {
+                return BooleanValue(value: false)
+            } else if left is UndefinedValue, right is UndefinedValue {
+                return BooleanValue(value: false)
+            } else if type(of: left) == type(of: right) {
                 return BooleanValue(value: true)
             } else {
-                return BooleanValue(value: left.value as! AnyHashable != right.value as! AnyHashable)
+                return BooleanValue(value: true)
             }
         }
-
         if left is UndefinedValue || right is UndefinedValue {
             throw JinjaError.runtime("Cannot perform operation on undefined values")
         } else if left is NullValue || right is NullValue {
             throw JinjaError.runtime("Cannot perform operation on null values")
         } else if let left = left as? NumericValue, let right = right as? NumericValue {
             switch node.operation.value {
-            case "+": throw JinjaError.syntaxNotSupported("+")
-            case "-": throw JinjaError.syntaxNotSupported("-")
-            case "*": throw JinjaError.syntaxNotSupported("*")
-            case "/": throw JinjaError.syntaxNotSupported("/")
-            case "%":
-                switch left.value {
-                case is Int:
-                    return NumericValue(value: left.value as! Int % (right.value as! Int))
-                default:
-                    throw JinjaError.runtime("Unknown value type:\(type(of: left.value))")
+            case "+":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftInt + rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return NumericValue(value: leftDouble + rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return NumericValue(value: Double(leftInt) + rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftDouble + Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for addition")
                 }
-            case "<": throw JinjaError.syntaxNotSupported("<")
-            case ">": throw JinjaError.syntaxNotSupported(">")
-            case ">=": throw JinjaError.syntaxNotSupported(">=")
-            case "<=": throw JinjaError.syntaxNotSupported("<=")
+            case "-":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftInt - rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return NumericValue(value: leftDouble - rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return NumericValue(value: Double(leftInt) - rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftDouble - Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for subtraction")
+                }
+            case "*":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftInt * rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return NumericValue(value: leftDouble * rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return NumericValue(value: Double(leftInt) * rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftDouble * Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for multiplication")
+                }
+            case "/":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftInt / rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return NumericValue(value: leftDouble / rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return NumericValue(value: Double(leftInt) / rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftDouble / Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for division")
+                }
+            case "%":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return NumericValue(value: leftInt % rightInt)
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for modulus")
+                }
+            case "<":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftInt < rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: leftDouble < rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: Double(leftInt) < rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftDouble < Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for less than comparison")
+                }
+            case ">":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftInt > rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: leftDouble > rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: Double(leftInt) > rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftDouble > Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for greater than comparison")
+                }
+            case ">=":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftInt >= rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: leftDouble >= rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: Double(leftInt) >= rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftDouble >= Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for greater than or equal to comparison")
+                }
+            case "<=":
+                if let leftInt = left.value as? Int, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftInt <= rightInt)
+                } else if let leftDouble = left.value as? Double, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: leftDouble <= rightDouble)
+                } else if let leftInt = left.value as? Int, let rightDouble = right.value as? Double {
+                    return BooleanValue(value: Double(leftInt) <= rightDouble)
+                } else if let leftDouble = left.value as? Double, let rightInt = right.value as? Int {
+                    return BooleanValue(value: leftDouble <= Double(rightInt))
+                } else {
+                    throw JinjaError.runtime("Unsupported numeric types for less than or equal to comparison")
+                }
             default:
                 throw JinjaError.runtime("Unknown operation type:\(node.operation.value)")
             }
-        } else if left is ArrayValue && right is ArrayValue {
-            switch node.operation.value {
-            case "+": break
-            default:
-                throw JinjaError.runtime("Unknown operation type:\(node.operation.value)")
-            }
-        } else if right is ArrayValue {
-            throw JinjaError.syntaxNotSupported("right is ArrayValue")
-        }
-
-        if left is StringValue || right is StringValue {
+        } else if let left = left as? ArrayValue, let right = right as? ArrayValue {
             switch node.operation.value {
             case "+":
-                var rightValue = ""
-                var leftValue = ""
-                switch right.value {
-                case let value as String:
-                    rightValue = value
-                case let value as Int:
-                    rightValue = String(value)
-                case let value as Bool:
-                    rightValue = String(value)
-                default:
-                    throw JinjaError.runtime("Unknown right value type:\(type(of: right.value))")
+                return ArrayValue(value: left.value + right.value)
+            default:
+                throw JinjaError.runtime("Unknown operation type:\(node.operation.value)")
+            }
+        } else if let right = right as? ArrayValue {
+            let member: Bool
+            if let left = left as? StringValue {
+                member = right.value.contains {
+                    if let item = $0 as? StringValue {
+                        return item.value == left.value
+                    }
+                    return false
                 }
-
-                switch left.value {
-                case let value as String:
-                    leftValue = value
-                case let value as Int:
-                    leftValue = String(value)
-                case let value as Bool:
-                    rightValue = String(value)
-                default:
-                    throw JinjaError.runtime("Unknown left value type:\(type(of: left.value))")
+            } else if let left = left as? NumericValue {
+                member = right.value.contains {
+                    if let item = $0 as? NumericValue {
+                        return item.value as! Int == left.value as! Int
+                    }
+                    return false
                 }
-
-                return StringValue(value: leftValue + rightValue)
+            } else if let left = left as? BooleanValue {
+                member = right.value.contains {
+                    if let item = $0 as? BooleanValue {
+                        return item.value == left.value
+                    }
+                    return false
+                }
+            } else {
+                throw JinjaError.runtime("Unsupported left type for 'in'/'not in' operation with ArrayValue")
+            }
+            switch node.operation.value {
+            case "in":
+                return BooleanValue(value: member)
+            case "not in":
+                return BooleanValue(value: !member)
+            default:
+                throw JinjaError.runtime("Unknown operation type:\(node.operation.value)")
+            }
+        }
+        if let left = left as? StringValue {
+            switch node.operation.value {
+            case "+":
+                let rightValue: String
+                if let rightString = right as? StringValue {
+                    rightValue = rightString.value
+                } else if let rightNumeric = right as? NumericValue {
+                    rightValue = String(describing: rightNumeric.value)
+                } else if let rightBoolean = right as? BooleanValue {
+                    rightValue = String(rightBoolean.value)
+                } else if right is UndefinedValue {
+                    rightValue = ""
+                } else {
+                    throw JinjaError.runtime("Unsupported right operand type for string concatenation")
+                }
+                return StringValue(value: left.value + rightValue)
+            case "in":
+                if let right = right as? StringValue {
+                    return BooleanValue(value: right.value.contains(left.value))
+                } else if let right = right as? ObjectValue {
+                    return BooleanValue(value: right.value.keys.contains(left.value))
+                } else if let right = right as? ArrayValue {
+                    return BooleanValue(
+                        value: right.value.contains {
+                            if let item = $0 as? StringValue {
+                                return item.value == left.value
+                            }
+                            return false
+                        }
+                    )
+                } else {
+                    throw JinjaError.runtime("Right operand of 'in' must be a StringValue, ArrayValue, or ObjectValue")
+                }
+            case "not in":
+                if let right = right as? StringValue {
+                    return BooleanValue(value: !right.value.contains(left.value))
+                } else if let right = right as? ObjectValue {
+                    return BooleanValue(value: !right.value.keys.contains(left.value))
+                } else if let right = right as? ArrayValue {
+                    return BooleanValue(
+                        value: !right.value.contains {
+                            if let item = $0 as? StringValue {
+                                return item.value == left.value
+                            }
+                            return false
+                        }
+                    )
+                } else {
+                    throw JinjaError.runtime(
+                        "Right operand of 'not in' must be a StringValue, ArrayValue, or ObjectValue"
+                    )
+                }
             default:
                 break
             }
-        }
-
-        if let left = left as? StringValue, let right = right as? StringValue {
-            switch node.operation.value {
-            case "in":
-                return BooleanValue(value: right.value.contains(left.value))
-            case "not in":
-                return BooleanValue(value: !right.value.contains(left.value))
-            default:
-                throw JinjaError.runtime("Unknown operation type:\(node.operation.value)")
+        } else if let right = right as? StringValue {
+            if node.operation.value == "+" {
+                if let leftString = left as? StringValue {
+                    return StringValue(value: leftString.value + right.value)
+                } else if let leftNumeric = left as? NumericValue {
+                    return StringValue(value: String(describing: leftNumeric.value) + right.value)
+                } else if let leftBoolean = left as? BooleanValue {
+                    return StringValue(value: String(leftBoolean.value) + right.value)
+                } else {
+                    throw JinjaError.runtime("Unsupported left operand type for string concatenation")
+                }
             }
         }
-
-        if left is StringValue, right is ObjectValue {
+        if let left = left as? StringValue, let right = right as? ObjectValue {
             switch node.operation.value {
             case "in":
-                if let leftString = (left as? StringValue)?.value,
-                    let rightObject = right as? ObjectValue
-                {
-                    return BooleanValue(value: rightObject.value.keys.contains(leftString))
-                }
+                return BooleanValue(value: right.value.keys.contains(left.value))
             case "not in":
-                if let leftString = (left as? StringValue)?.value,
-                    let rightObject = right as? ObjectValue
-                {
-                    return BooleanValue(value: !rightObject.value.keys.contains(leftString))
-                }
+                return BooleanValue(value: !right.value.keys.contains(left.value))
             default:
                 throw JinjaError.runtime(
                     "Unsupported operation '\(node.operation.value)' between StringValue and ObjectValue"
                 )
             }
         }
-
         throw JinjaError.syntax(
             "Unknown operator '\(node.operation.value)' between \(type(of:left)) and \(type(of:right))"
         )
@@ -442,49 +794,42 @@ struct Interpreter {
         if !(object is ArrayValue || object is StringValue) {
             throw JinjaError.runtime("Slice object must be an array or string")
         }
-
         let start = try self.evaluate(statement: expr.start, environment: environment)
         let stop = try self.evaluate(statement: expr.stop, environment: environment)
         let step = try self.evaluate(statement: expr.step, environment: environment)
-
         if !(start is NumericValue || start is UndefinedValue) {
             throw JinjaError.runtime("Slice start must be numeric or undefined")
         }
-
         if !(stop is NumericValue || stop is UndefinedValue) {
             throw JinjaError.runtime("Slice stop must be numeric or undefined")
         }
-
         if !(step is NumericValue || step is UndefinedValue) {
             throw JinjaError.runtime("Slice step must be numeric or undefined")
         }
-
         if let object = object as? ArrayValue {
             return ArrayValue(
                 value: slice(
                     object.value,
-                    start: start.value as? Int,
-                    stop: stop.value as? Int,
-                    step: step.value as? Int
+                    start: (start as? NumericValue)?.value as? Int,
+                    stop: (stop as? NumericValue)?.value as? Int,
+                    step: (step as? NumericValue)?.value as? Int
                 )
             )
         } else if let object = object as? StringValue {
             return StringValue(
                 value: slice(
-                    Array(arrayLiteral: object.value),
-                    start: start.value as? Int,
-                    stop: stop.value as? Int,
-                    step: step.value as? Int
-                ).joined()
+                    Array(object.value),
+                    start: (start as? NumericValue)?.value as? Int,
+                    stop: (stop as? NumericValue)?.value as? Int,
+                    step: (step as? NumericValue)?.value as? Int
+                ).map { String($0) }.joined()
             )
         }
-
         throw JinjaError.runtime("Slice object must be an array or string")
     }
 
     func evaluateMemberExpression(expr: MemberExpression, environment: Environment) throws -> any RuntimeValue {
         let object = try self.evaluate(statement: expr.object, environment: environment)
-
         var property: any RuntimeValue
         if expr.computed {
             if let property = expr.property as? SliceExpression {
@@ -495,7 +840,6 @@ struct Interpreter {
         } else {
             property = StringValue(value: (expr.property as! Identifier).value)
         }
-
         var value: (any RuntimeValue)?
         if let object = object as? ObjectValue {
             if let property = property as? StringValue {
@@ -503,34 +847,55 @@ struct Interpreter {
             } else {
                 throw JinjaError.runtime("Cannot access property with non-string: got \(type(of:property))")
             }
-        } else if object is ArrayValue || object is StringValue {
+        } else if let object = object as? ArrayValue {
             if let property = property as? NumericValue {
-                if let object = object as? ArrayValue {
-                    let index = property.value as! Int
-                    if index >= 0 {
+                if let index = property.value as? Int {
+                    if index >= 0 && index < object.value.count {
                         value = object.value[index]
-                    } else {
+                    } else if index < 0 && index >= -object.value.count {
                         value = object.value[object.value.count + index]
+                    } else {
+                        value = UndefinedValue()
                     }
-                } else if let object = object as? StringValue {
-                    let index = object.value.index(object.value.startIndex, offsetBy: property.value as! Int)
-                    value = StringValue(value: String(object.value[index]))
+                } else {
+                    throw JinjaError.runtime("Array index must be an integer")
                 }
             } else if let property = property as? StringValue {
                 value = object.builtins[property.value]
             } else {
                 throw JinjaError.runtime(
-                    "Cannot access property with non-string/non-number: got \(type(of:property))"
+                    "Cannot access property with non-string/non-number: got \(type(of: property))"
+                )
+            }
+        } else if let object = object as? StringValue {
+            if let property = property as? NumericValue {
+                if let index = property.value as? Int {
+                    if index >= 0 && index < object.value.count {
+                        let strIndex = object.value.index(object.value.startIndex, offsetBy: index)
+                        value = StringValue(value: String(object.value[strIndex]))
+                    } else if index < 0 && index >= -object.value.count {
+                        let strIndex = object.value.index(object.value.startIndex, offsetBy: object.value.count + index)
+                        value = StringValue(value: String(object.value[strIndex]))
+                    } else {
+                        value = UndefinedValue()
+                    }
+                } else {
+                    throw JinjaError.runtime("String index must be an integer")
+                }
+            } else if let property = property as? StringValue {
+                value = object.builtins[property.value]
+            } else {
+                throw JinjaError.runtime(
+                    "Cannot access property with non-string/non-number: got \(type(of: property))"
                 )
             }
         } else {
             if let property = property as? StringValue {
-                value = object.builtins[property.value]!
+                value = object.builtins[property.value]
             } else {
                 throw JinjaError.runtime("Cannot access property with non-string: got \(type(of:property))")
             }
         }
-
         if let value {
             return value
         } else {
@@ -540,7 +905,6 @@ struct Interpreter {
 
     func evaluateUnaryExpression(node: UnaryExpression, environment: Environment) throws -> any RuntimeValue {
         let argument = try self.evaluate(statement: node.argument, environment: environment)
-
         switch node.operation.value {
         case "not":
             return BooleanValue(value: !argument.bool())
@@ -552,7 +916,6 @@ struct Interpreter {
     func evaluateCallExpression(expr: CallExpression, environment: Environment) throws -> any RuntimeValue {
         var args: [any RuntimeValue] = []
         var kwargs: [String: any RuntimeValue] = [:]
-
         for argument in expr.args {
             if let argument = argument as? KeywordArgumentExpression {
                 kwargs[argument.key.value] = try self.evaluate(statement: argument.value, environment: environment)
@@ -560,13 +923,10 @@ struct Interpreter {
                 try args.append(self.evaluate(statement: argument, environment: environment))
             }
         }
-
-        if kwargs.count > 0 {
+        if !kwargs.isEmpty {
             args.append(ObjectValue(value: kwargs))
         }
-
         let fn = try self.evaluate(statement: expr.callee, environment: environment)
-
         if let fn = fn as? FunctionValue {
             return try fn.value(args, environment)
         } else {
@@ -574,89 +934,108 @@ struct Interpreter {
         }
     }
 
-    func evaluateFilterExpression(node: FilterExpression, environment: Environment) throws -> any RuntimeValue {
-        let operand = try evaluate(statement: node.operand, environment: environment)
-
-        if let identifier = node.filter as? Identifier {
-            if let arrayValue = operand as? ArrayValue {
-                switch identifier.value {
-                case "list":
-                    return arrayValue
-                case "first":
-                    return arrayValue.value.first ?? UndefinedValue()
-                case "last":
-                    return arrayValue.value.last ?? UndefinedValue()
-                case "length":
-                    return NumericValue(value: arrayValue.value.count)
-                case "reverse":
-                    return ArrayValue(value: arrayValue.value.reversed())
-                case "sort":
-                    throw JinjaError.todo("TODO: ArrayValue filter sort")
-                default:
-                    throw JinjaError.runtime("Unknown ArrayValue filter: \(identifier.value)")
-                }
-            } else if let stringValue = operand as? StringValue {
-                switch identifier.value {
-                case "length":
-                    return NumericValue(value: stringValue.value.count)
-                case "upper":
-                    return StringValue(value: stringValue.value.uppercased())
-                case "lower":
-                    return StringValue(value: stringValue.value.lowercased())
-                case "title":
-                    return StringValue(value: stringValue.value.capitalized)
-                case "capitalize":
-                    return StringValue(value: stringValue.value.capitalized)
-                case "trim":
-                    return StringValue(value: stringValue.value.trimmingCharacters(in: .whitespacesAndNewlines))
-                default:
-                    throw JinjaError.runtime("Unknown StringValue filter: \(identifier.value)")
-                }
-            } else if let numericValue = operand as? NumericValue {
-                switch identifier.value {
-                case "abs":
-                    return NumericValue(value: abs(numericValue.value as! Int32))
-                default:
-                    throw JinjaError.runtime("Unknown NumericValue filter: \(identifier.value)")
-                }
-            } else if let objectValue = operand as? ObjectValue {
-                switch identifier.value {
-                case "items":
-                    var items: [ArrayValue] = []
-                    for (k, v) in objectValue.value {
-                        items.append(
-                            ArrayValue(value: [
-                                StringValue(value: k),
-                                v,
-                            ])
-                        )
-                    }
-                    return items as! (any RuntimeValue)
-                case "length":
-                    return NumericValue(value: objectValue.value.count)
-                default:
-                    throw JinjaError.runtime("Unknown ObjectValue filter: \(identifier.value)")
-                }
-            }
-
-            throw JinjaError.runtime("Cannot apply filter \(operand.value) to type: \(type(of:operand))")
+    func evaluateFilterExpression(node: FilterExpression, environment: Environment, whitespaceControl: Bool) throws
+        -> any RuntimeValue
+    {
+        let operand = try self.evaluate(statement: node.operand, environment: environment)
+        let filterName = node.filter.value
+        guard let filter = environment.filters[filterName] else {
+            throw JinjaError.runtime("No filter named '\(filterName)'")
         }
-
-        throw JinjaError.runtime("Unknown filter: \(node.filter)")
+        // Evaluate positional arguments
+        let evaluatedPositionalArgs = try node.args.map { arg in
+            try self.evaluate(statement: arg, environment: environment)
+        }
+        // Create args array starting with operand
+        var args: [any RuntimeValue] = [operand]
+        args.append(contentsOf: evaluatedPositionalArgs)
+        // If we have keyword arguments, add them as a final ObjectValue argument
+        if !node.kwargs.isEmpty {
+            var kwargs: [String: any RuntimeValue] = [:]
+            for kwarg in node.kwargs {
+                kwargs[kwarg.key.value] = try self.evaluate(statement: kwarg.value, environment: environment)
+            }
+            args.append(ObjectValue(value: kwargs))
+        }
+        return try filter(args, environment)
     }
 
     func evaluateTestExpression(node: TestExpression, environment: Environment) throws -> any RuntimeValue {
         let operand = try self.evaluate(statement: node.operand, environment: environment)
-
-        if let testFunction = environment.tests[node.test.value] {
-            let result = try testFunction(operand)
-            return BooleanValue(value: node.negate ? !result : result)
-        } else {
+        guard let testFunction = environment.tests[node.test.value] else {
             throw JinjaError.runtime("Unknown test: \(node.test.value)")
         }
+        let result = try testFunction(operand)
+        return BooleanValue(value: node.negate ? !result : result)
     }
 
-    func evaluate(statement: Statement?, environment: Environment) throws -> any RuntimeValue {
+    func evaluateMacro(node: Macro, environment: Environment) throws -> NullValue {
+        try environment.setVariable(
+            name: node.name.value,
+            value: FunctionValue(value: { args, scope in
+                let macroScope = Environment(parent: scope)
+                var args = args
+                var kwargs: [String: any RuntimeValue] = [:]
+                if let lastArg = args.last, let keywordArgsValue = lastArg as? KeywordArgumentsValue {
+                    kwargs = keywordArgsValue.value
+                    args.removeLast()
+                }
+                for i in 0 ..< node.args.count {
+                    let nodeArg = node.args[i]
+                    let passedArg = args.count > i ? args[i] : nil
+
+                    if let identifier = nodeArg as? Identifier {
+                        if passedArg == nil {
+                            if let defaultValue = kwargs[identifier.value] {
+                                try macroScope.setVariable(name: identifier.value, value: defaultValue)
+                            } else {
+                                throw JinjaError.runtime("Missing argument: \(identifier.value)")
+                            }
+                        } else {
+                            try macroScope.setVariable(name: identifier.value, value: passedArg!)
+                        }
+                    } else if let kwarg = nodeArg as? KeywordArgumentExpression {
+                        let value =
+                            try kwargs[kwarg.key.value]
+                            ?? (passedArg ?? (try self.evaluate(statement: kwarg.value, environment: macroScope)))
+
+                        try macroScope.setVariable(name: kwarg.key.value, value: value)
+                    } else {
+                        throw JinjaError.runtime("Unknown argument type: \(type(of: nodeArg))")
+                    }
+                }
+                return try self.evaluateBlock(statements: node.body, environment: macroScope)
+            })
+        )
+        return NullValue()
+    }
+
+    func evaluateArguments(
+        args: [Expression],
+        environment: Environment
+    ) throws -> ([any RuntimeValue], [String: any RuntimeValue]) {
+        var positionalArguments: [any RuntimeValue] = []
+        var keywordArguments: [String: any RuntimeValue] = [:]
+        for argument in args {
+            if let keywordArgument = argument as? KeywordArgumentExpression {
+                keywordArguments[keywordArgument.key.value] = try self.evaluate(
+                    statement: keywordArgument.value,
+                    environment: environment
+                )
+            } else {
+                if !keywordArguments.isEmpty {
+                    throw JinjaError.runtime("Positional arguments must come before keyword arguments")
+                }
+                positionalArguments.append(try self.evaluate(statement: argument, environment: environment))
+            }
+        }
+
+        return (positionalArguments, keywordArguments)
+    }
+
+    func evaluate(statement: Statement?, environment: Environment, whitespaceControl: Bool = false) throws
+        -> any RuntimeValue
+    {
         if let statement {
             switch statement {
             case let statement as Program:
@@ -678,15 +1057,41 @@ struct Interpreter {
             case let statement as UnaryExpression:
                 return try self.evaluateUnaryExpression(node: statement, environment: environment)
             case let statement as NumericLiteral:
-                return NumericValue(value: statement.value)
+                if let intValue = statement.value as? Int {
+                    return NumericValue(value: intValue)
+                } else if let doubleValue = statement.value as? Double {
+                    return NumericValue(value: doubleValue)
+                } else {
+                    throw JinjaError.runtime("Invalid numeric literal value")
+                }
             case let statement as CallExpression:
                 return try self.evaluateCallExpression(expr: statement, environment: environment)
             case let statement as BoolLiteral:
                 return BooleanValue(value: statement.value)
             case let statement as FilterExpression:
-                return try self.evaluateFilterExpression(node: statement, environment: environment)
+                return try self.evaluateFilterExpression(
+                    node: statement,
+                    environment: environment,
+                    whitespaceControl: whitespaceControl
+                )
             case let statement as TestExpression:
                 return try self.evaluateTestExpression(node: statement, environment: environment)
+            case let statement as ArrayLiteral:
+                return ArrayValue(
+                    value: try statement.value.map { try self.evaluate(statement: $0, environment: environment) }
+                )
+            case let statement as TupleLiteral:
+                return TupleValue(
+                    value: try statement.value.map { try self.evaluate(statement: $0, environment: environment) }
+                )
+            case let statement as ObjectLiteral:
+                var mapping: [String: any RuntimeValue] = [:]
+                for (key, value) in statement.value {
+                    mapping[key] = try self.evaluate(statement: value, environment: environment)
+                }
+                return ObjectValue(value: mapping)
+            case let statement as Macro:
+                return try self.evaluateMacro(node: statement, environment: environment)
             case is NullLiteral:
                 return NullValue()
             default:

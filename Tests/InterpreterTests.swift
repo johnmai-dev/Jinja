@@ -141,17 +141,18 @@ final class InterpreterTests: XCTestCase {
         for test in tests {
             let env = Environment()
             try env.set(name: "True", value: true)
-
             for (key, value) in test.data {
                 try env.set(name: key, value: value)
             }
-
             let tokens = try tokenize(test.template, options: test.options)
             let parsed = try parse(tokens: tokens)
             let interpreter = Interpreter(env: env)
-            let result = try interpreter.run(program: parsed).value as! String
-
-            XCTAssertEqual(result.debugDescription, test.target.debugDescription)
+            let result = try interpreter.run(program: parsed)
+            if let stringResult = result as? StringValue {
+                XCTAssertEqual(stringResult.value.debugDescription, test.target.debugDescription)
+            } else {
+                XCTFail("Expected a StringValue, but got \(type(of: result))")
+            }
         }
     }
 }
