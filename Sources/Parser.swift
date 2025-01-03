@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import OrderedCollections
 
 func parse(tokens: [Token]) throws -> Program {
     var program = Program()
@@ -22,40 +23,31 @@ func parse(tokens: [Token]) throws -> Program {
         return prev
     }
 
-    func parseArgumentsList() throws -> [Statement] {
+    func parseArgumentsList() throws -> [Expression] {
         var args: [Expression] = []
-
         while !typeof(.closeParen) {
             var argument = try parseExpression()
-
             if typeof(.equals) {
-                current += 1
-
+                current += 1  // consume equals
                 if let identifier = argument as? Identifier {
                     let value = try parseExpression()
-                    argument = KeywordArgumentExpression(key: identifier, value: value as! Expression)
+                    argument = KeywordArgumentExpression(key: identifier, value: value)
                 } else {
                     throw JinjaError.syntax("Expected identifier for keyword argument")
                 }
             }
-
-            args.append(argument as! Expression)
-
+            args.append(argument)
             if typeof(.comma) {
-                current += 1
+                current += 1  // consume comma
             }
         }
-
         return args
     }
 
-    func parseArgs() throws -> [Statement] {
+    func parseArgs() throws -> [Expression] {
         try expect(type: .openParen, error: "Expected opening parenthesis for arguments list")
-
         let args = try parseArgumentsList()
-
         try expect(type: .closeParen, error: "Expected closing parenthesis for arguments list")
-
         return args
     }
 
@@ -63,69 +55,54 @@ func parse(tokens: [Token]) throws -> Program {
         try StringLiteral(value: expect(type: .text, error: "Expected text token").value)
     }
 
-    func parseCallExpression(callee: Statement) throws -> CallExpression {
-        var args: [Expression] = []
-
-        for arg in try parseArgs() {
-            args.append(arg as! Expression)
-        }
-
-        var callExpression = CallExpression(callee: callee as! Expression, args: args)
-
+    func parseCallExpression(callee: Expression) throws -> CallExpression {
+        let args = try parseArgs()
+        var callExpression = CallExpression(callee: callee, args: args)
         if typeof(.openParen) {
             callExpression = try parseCallExpression(callee: callExpression)
         }
-
         return callExpression
     }
 
-    func parseMemberExpressionArgumentsList() throws -> Statement {
-        var slices: [Statement?] = []
+    func parseMemberExpressionArgumentsList() throws -> Expression {
+        var slices: [Expression?] = []
         var isSlice = false
-
         while !typeof(.closeSquareBracket) {
             if typeof(.colon) {
                 slices.append(nil)
-                current += 1
+                current += 1  // consume colon
                 isSlice = true
             } else {
-                try slices.append(parseExpression())
+                slices.append(try parseExpression())
                 if typeof(.colon) {
-                    current += 1
+                    current += 1  // consume colon
                     isSlice = true
                 }
             }
         }
-
         if slices.isEmpty {
             throw JinjaError.syntax("Expected at least one argument for member/slice expression")
         }
-
         if isSlice {
             if slices.count > 3 {
                 throw JinjaError.syntax("Expected 0-3 arguments for slice expression")
             }
-
             return SliceExpression(
-                start: slices[0] as? Expression,
-                stop: slices.count > 1 ? slices[1] as? Expression : nil,
-                step: slices.count > 2 ? slices[2] as? Expression : nil
+                start: slices[0],
+                stop: slices.count > 1 ? slices[1] : nil,
+                step: slices.count > 2 ? slices[2] : nil
             )
         }
-
-        return slices[0]!
+        return slices[0]!  // normal member expression
     }
 
-    func parseMemberExpression() throws -> Statement {
+    func parseMemberExpression() throws -> Expression {
         var object = try parsePrimaryExpression()
-
         while typeof(.dot) || typeof(.openSquareBracket) {
             let operation = tokens[current]
             current += 1
-            var property: Statement
-
+            var property: Expression
             let computed = operation.type != .dot
-
             if computed {
                 property = try parseMemberExpressionArgumentsList()
                 try expect(type: .closeSquareBracket, error: "Expected closing square bracket")
@@ -135,52 +112,109 @@ func parse(tokens: [Token]) throws -> Program {
                     throw JinjaError.syntax("Expected identifier following dot operator")
                 }
             }
-
             object = MemberExpression(
-                object: object as! Expression,
-                property: property as! Expression,
+                object: object,
+                property: property,
                 computed: computed
             )
         }
-
         return object
     }
 
-    func parseCallMemberExpression() throws -> Statement {
+    func parseCallMemberExpression() throws -> Expression {
         let member = try parseMemberExpression()
-
         if typeof(.openParen) {
             return try parseCallExpression(callee: member)
         }
-
         return member
     }
 
-    func parseFilterExpression() throws -> Statement {
+    func parseFilterExpression() throws -> Expression {
         var operand = try parseCallMemberExpression()
-
         while typeof(.pipe) {
-            current += 1
-            var filter = try parsePrimaryExpression()
-            if !(filter is Identifier) {
-                throw JinjaError.syntax("Expected identifier for the test")
+            current += 1  // consume pipe
+            guard let filterName = try parsePrimaryExpression() as? Identifier else {
+                throw JinjaError.syntax("Expected identifier for the filter")
             }
-
+            var args: [Expression] = []
+            var kwargs: [KeywordArgumentExpression] = []
+            var dyn_args: Expression?
+            var dyn_kwargs: Expression?
             if typeof(.openParen) {
-                filter = try parseCallExpression(callee: filter)
+                // Handle filter with arguments
+                (args, kwargs, dyn_args, dyn_kwargs) = try parseCallArgs()
             }
-
-            if let filter = filter as? Filter {
-                operand = FilterExpression(operand: operand as! Expression, filter: filter)
-            }
+            operand = FilterExpression(
+                operand: operand,
+                filter: filterName,
+                args: args,
+                kwargs: kwargs,
+                dyn_args: dyn_args,
+                dyn_kwargs: dyn_kwargs
+            )
         }
-
         return operand
     }
 
-    func parseTestExpression() throws -> Statement {
-        var operand = try parseFilterExpression()
+    func parseCallArgs() throws -> (
+        [Expression], [KeywordArgumentExpression], Expression?, Expression?
+    ) {
+        try expect(type: .openParen, error: "Expected opening parenthesis for arguments list")
+        var args: [Expression] = []
+        var kwargs: [KeywordArgumentExpression] = []
+        var dynArgs: Expression?
+        var dynKwargs: Expression?
+        var requireComma = false
+        while !typeof(.closeParen) {
+            if requireComma {
+                try expect(type: .comma, error: "Expected comma between arguments")
+                if typeof(.closeParen) {
+                    break
+                }
+            }
+            if typeof(.multiplicativeBinaryOperator), tokens[current].value == "*" {
+                current += 1  // Consume *
+                if dynArgs != nil || dynKwargs != nil {
+                    throw JinjaError.syntax("Multiple dynamic positional arguments are not allowed.")
+                }
+                dynArgs = try parseExpression()
+            } else if typeof(.multiplicativeBinaryOperator), tokens[current].value == "**" {
+                current += 1  // Consume **
+                if dynKwargs != nil {
+                    throw JinjaError.syntax("Multiple dynamic keyword arguments are not allowed.")
+                }
+                dynKwargs = try parseExpression()
+            } else {
+                if typeof(.identifier), tokens.count > current + 1, tokens[current + 1].type == .equals {
+                    // Parse keyword argument
+                    guard let key = try parsePrimaryExpression() as? Identifier else {
+                        throw JinjaError.syntax("Expected identifier for keyword argument key")
+                    }
+                    try expect(type: .equals, error: "Expected '=' after keyword argument key")
+                    let value = try parseExpression()
+                    if dynKwargs != nil {
+                        throw JinjaError.syntax("Keyword arguments must be after dynamic keyword arguments")
+                    }
+                    kwargs.append(KeywordArgumentExpression(key: key, value: value))
+                } else {
+                    // Parse positional argument
+                    if !kwargs.isEmpty || dynKwargs != nil {
+                        throw JinjaError.syntax("Positional argument after keyword argument")
+                    }
+                    if dynArgs != nil {
+                        throw JinjaError.syntax("Positional arguments must be after dynamic positional arguments")
+                    }
+                    args.append(try parseExpression())
+                }
+            }
+            requireComma = true
+        }
+        try expect(type: .closeParen, error: "Expected closing parenthesis for arguments list")
+        return (args, kwargs, dynArgs, dynKwargs)
+    }
 
+    func parseTestExpression() throws -> Expression {
+        var operand = try parseFilterExpression()
         while typeof(.is) {
             current += 1
             let negate = typeof(.not)
@@ -194,7 +228,7 @@ func parse(tokens: [Token]) throws -> Program {
                 filter = Identifier(value: "none")
             }
             if let test = filter as? Identifier {
-                operand = TestExpression(operand: operand as! Expression, negate: negate, test: test)
+                operand = TestExpression(operand: operand, negate: negate, test: test)
             } else {
                 throw JinjaError.syntax("Expected identifier for the test")
             }
@@ -202,96 +236,116 @@ func parse(tokens: [Token]) throws -> Program {
         return operand
     }
 
-    func parseMultiplicativeExpression() throws -> Statement {
+    func parseMultiplicativeExpression() throws -> Expression {
         var left = try parseTestExpression()
-
         while typeof(.multiplicativeBinaryOperator) {
             let operation = tokens[current]
             current += 1
             let right = try parseTestExpression()
-            left = BinaryExpression(operation: operation, left: left as! Expression, right: right as! Expression)
+            left = BinaryExpression(operation: operation, left: left, right: right)
         }
         return left
     }
 
-    func parseAdditiveExpression() throws -> Statement {
+    func parseAdditiveExpression() throws -> Expression {
         var left = try parseMultiplicativeExpression()
         while typeof(.additiveBinaryOperator) {
             let operation = tokens[current]
             current += 1
             let right = try parseMultiplicativeExpression()
-            left = BinaryExpression(operation: operation, left: left as! Expression, right: right as! Expression)
+            left = BinaryExpression(operation: operation, left: left, right: right)
         }
         return left
     }
 
-    func parseComparisonExpression() throws -> Statement {
+    func parseComparisonExpression() throws -> Expression {
         var left = try parseAdditiveExpression()
-        while typeof(.comparisonBinaryOperator) || typeof(.in) || typeof(.notIn) {
+        while typeof(.comparisonBinaryOperator) || typeof(.in) || typeof(.notIn)
+            || (typeof(.is)
+                && (tokens.count > current + 1
+                    && (tokens[current + 1].type == .identifier || tokens[current + 1].type == .not)))
+        {
             let operation = tokens[current]
             current += 1
-            let right = try parseAdditiveExpression()
-            left = BinaryExpression(operation: operation, left: left as! Expression, right: right as! Expression)
+            if operation.type == .is {
+                if typeof(.not) {
+                    current += 1
+                    if typeof(.identifier), tokens[current].value == "none" {
+                        current += 1
+                        left = TestExpression(operand: left, negate: true, test: Identifier(value: "none"))
+                        continue
+                    } else {
+                        throw JinjaError.syntax("Expected 'none' after 'is not'")
+                    }
+                } else if typeof(.identifier), tokens[current].value == "defined" {
+                    current += 1
+                    left = TestExpression(operand: left, negate: false, test: Identifier(value: "defined"))
+                    continue
+                } else {
+                    throw JinjaError.syntax("Expected 'defined' or 'not' after 'is'")
+                }
+            } else if operation.type == .notIn {
+                let right = try parseAdditiveExpression()
+                left = BinaryExpression(operation: operation, left: left, right: right)
+            } else {
+                let right = try parseAdditiveExpression()
+                left = BinaryExpression(operation: operation, left: left, right: right)
+            }
         }
-
         return left
     }
 
-    func parseLogicalNegationExpression() throws -> Statement {
-        var right: UnaryExpression?
-
-        while typeof(.not) {
+    func parseLogicalNegationExpression() throws -> Expression {
+        if typeof(.not) {
             let operation = tokens[current]
             current += 1
             let argument = try parseLogicalNegationExpression()
-            right = UnaryExpression(operation: operation, argument: argument as! Expression)
-        }
-
-        if let right {
-            return right
+            return UnaryExpression(operation: operation, argument: argument)
         } else {
             return try parseComparisonExpression()
         }
     }
 
-    func parseLogicalAndExpression() throws -> Statement {
+    func parseLogicalAndExpression() throws -> Expression {
         var left = try parseLogicalNegationExpression()
         while typeof(.and) {
             let operation = tokens[current]
             current += 1
             let right = try parseLogicalNegationExpression()
-            left = BinaryExpression(operation: operation, left: left as! Expression, right: right as! Expression)
+            left = BinaryExpression(operation: operation, left: left, right: right)
         }
-
         return left
     }
 
-    func parseLogicalOrExpression() throws -> Statement {
+    func parseLogicalOrExpression() throws -> Expression {
         var left = try parseLogicalAndExpression()
-
         while typeof(.or) {
-            let operation = tokens[current]
-            current += 1
+            current += 1  // Consume 'or'
             let right = try parseLogicalAndExpression()
-            left = BinaryExpression(operation: operation, left: left as! Expression, right: right as! Expression)
+            left = BinaryExpression(operation: Token(value: "or", type: .or), left: left, right: right)
         }
         return left
     }
 
-    func parseTernaryExpression() throws -> Statement {
+    func parseTernaryExpression() throws -> Expression {
         let a = try parseLogicalOrExpression()
         if typeof(.if) {
-            current += 1
-            let test = try parseLogicalOrExpression()
-            try expect(type: .else, error: "Expected else token")
-            let b = try parseLogicalOrExpression()
-            return If(test: test as! Expression, body: [a], alternate: [b])
+            current += 1  // consume if token
+            let predicate = try parseLogicalOrExpression()
+            if typeof(.else) {
+                // Ternary expression with else
+                current += 1  // consume else token
+                let b = try parseLogicalOrExpression()
+                return If(test: predicate, body: [a], alternate: [b])
+            } else {
+                // Select expression on iterable
+                return SelectExpression(iterable: a, test: predicate)
+            }
         }
-
         return a
     }
 
-    func parseExpression() throws -> Statement {
+    func parseExpression() throws -> Expression {
         try parseTernaryExpression()
     }
 
@@ -299,66 +353,66 @@ func parse(tokens: [Token]) throws -> Program {
         guard current + types.count <= tokens.count else {
             return false
         }
-
         for (index, type) in types.enumerated() {
             if type != tokens[current + index].type {
                 return false
             }
         }
-
         return true
     }
 
     func parseSetStatement() throws -> Statement {
         let left = try parseExpression()
-
         if typeof(.equals) {
             current += 1
-            let value = try parseSetStatement()
-
-            return Set(assignee: left as! Expression, value: value as! Expression)
+            // Parse the right-hand side as an expression
+            let value = try parseExpression()
+            // Explicitly cast 'value' to 'Expression'
+            return Set(assignee: left, value: value)
         }
-
         return left
     }
 
     func parseIfStatement() throws -> Statement {
         let test = try parseExpression()
-
         try expect(type: .closeStatement, error: "Expected closing statement token")
-
         var body: [Statement] = []
         var alternate: [Statement] = []
-
         while !(tokens[current].type == .openStatement
             && (tokens[current + 1].type == .elseIf || tokens[current + 1].type == .else
                 || tokens[current + 1].type == .endIf))
         {
-            try body.append(parseAny())
+            body.append(try parseAny())
         }
         if tokens[current].type == .openStatement, tokens[current + 1].type != .endIf {
             current += 1
             if typeof(.elseIf) {
                 try expect(type: .elseIf, error: "Expected elseif token")
-                try alternate.append(parseIfStatement())
+                alternate.append(try parseIfStatement())
             } else {
                 try expect(type: .else, error: "Expected else token")
                 try expect(type: .closeStatement, error: "Expected closing statement token")
 
                 while !(tokens[current].type == .openStatement && tokens[current + 1].type == .endIf) {
-                    try alternate.append(parseAny())
+                    alternate.append(try parseAny())
                 }
             }
         }
-        return If(test: test as! Expression, body: body, alternate: alternate)
+        return If(test: test, body: body, alternate: alternate)
     }
 
-    func parsePrimaryExpression() throws -> Statement {
+    func parsePrimaryExpression() throws -> Expression {
         let token = tokens[current]
         switch token.type {
         case .numericLiteral:
             current += 1
-            return NumericLiteral(value: Int(token.value) ?? 0)
+            if let intValue = Int(token.value) {
+                return NumericLiteral(value: intValue)
+            } else if let doubleValue = Double(token.value) {
+                return NumericLiteral(value: doubleValue)
+            } else {
+                throw JinjaError.parser("Invalid numeric literal: \(token.value)")
+            }
         case .stringLiteral:
             current += 1
             return StringLiteral(value: token.value)
@@ -383,7 +437,7 @@ func parse(tokens: [Token]) throws -> Program {
             current += 1
             var values: [Expression] = []
             while !typeof(.closeSquareBracket) {
-                try values.append(parseExpression() as! Expression)
+                try values.append(parseExpression())
                 if typeof(.comma) {
                     current += 1
                 }
@@ -392,12 +446,20 @@ func parse(tokens: [Token]) throws -> Program {
             return ArrayLiteral(value: values)
         case .openCurlyBracket:
             current += 1
-            var values: [(Expression, Expression)] = []
+            var values = OrderedDictionary<String, Expression>()
             while !typeof(.closeCurlyBracket) {
                 let key = try parseExpression()
                 try expect(type: .colon, error: "Expected colon between key and value in object literal")
                 let value = try parseExpression()
-                values.append((key as! Expression, value as! Expression))
+
+                if let key = key as? StringLiteral {
+                    values[key.value] = value
+                } else if let key = key as? Identifier {
+                    values[key.value] = value
+                } else {
+                    throw JinjaError.syntax("Expected string literal or identifier as key in object literal")
+                }
+
                 if typeof(.comma) {
                     current += 1
                 }
@@ -409,18 +471,18 @@ func parse(tokens: [Token]) throws -> Program {
         }
     }
 
-    func parseExpressionSequence(primary: Bool = false) throws -> Statement {
+    func parseExpressionSequence(primary: Bool = false) throws -> Expression {
         let fn = primary ? parsePrimaryExpression : parseExpression
-        var expressions: [Expression] = try [fn() as! Expression]
+        var expressions: [Expression] = try [fn()]
         let isTuple = typeof(.comma)
         while isTuple {
-            current += 1
-            try expressions.append(fn() as! Expression)
+            current += 1  // consume comma
+            try expressions.append(fn())
             if !typeof(.comma) {
                 break
             }
         }
-
+        // Return either a tuple or single expression
         return isTuple ? TupleLiteral(value: expressions) : expressions[0]
     }
 
@@ -428,7 +490,6 @@ func parse(tokens: [Token]) throws -> Program {
         guard current + types.count <= tokens.count else {
             return false
         }
-
         return types.enumerated().contains { i, type -> Bool in
             type != tokens[current + i].type
         }
@@ -436,50 +497,80 @@ func parse(tokens: [Token]) throws -> Program {
 
     func parseForStatement() throws -> Statement {
         let loopVariable = try parseExpressionSequence(primary: true)
-
         if !(loopVariable is Identifier || loopVariable is TupleLiteral) {
             throw JinjaError.syntax(
-                "Expected identifier/tuple for the loop variable, got \(type(of:loopVariable)) instead"
+                "Expected identifier/tuple for the loop variable, got \(type(of: loopVariable)) instead"
             )
         }
-
         try expect(type: .in, error: "Expected `in` keyword following loop variable")
-
         let iterable = try parseExpression()
-
+        // Handle optional if condition for filtering
+        var ifCondition: Expression? = nil
+        if typeof(.if) {
+            current += 1  // consume if token
+            ifCondition = try parseExpression()
+        }
         try expect(type: .closeStatement, error: "Expected closing statement token")
-
         var body: [Statement] = []
-        while not(.openStatement, .endFor) {
-            try body.append(parseAny())
+        var defaultBlock: [Statement] = []
+        while not(.openStatement, .endFor) && not(.openStatement, .else) {
+            body.append(try parseAny())
         }
+        if typeof(.openStatement, .else) {
+            current += 1  // consume {%
+            try expect(type: .else, error: "Expected else token")
+            try expect(type: .closeStatement, error: "Expected closing statement token")
 
-        if let loopVariable = loopVariable as? Loopvar {
-            return For(loopvar: loopVariable, iterable: iterable as! Expression, body: body)
+            while not(.openStatement, .endFor) {
+                defaultBlock.append(try parseAny())
+            }
         }
-
-        throw JinjaError.syntax(
-            "Expected identifier/tuple for the loop variable, got \(type(of:loopVariable)) instead"
+        return For(
+            loopvar: loopVariable,
+            iterable: iterable,
+            body: body,
+            defaultBlock: defaultBlock,
+            ifCondition: ifCondition
         )
     }
 
+    func parseMacroStatement() throws -> Macro {
+        let name = try parsePrimaryExpression()
+        if !(name is Identifier) {
+            throw JinjaError.syntax("Expected identifier following macro statement")
+        }
+        let args = try parseArgs()
+        try expect(type: .closeStatement, error: "Expected closing statement token")
+        var body: [Statement] = []
+        while not(.openStatement, .endMacro) {
+            body.append(try parseAny())
+        }
+        return Macro(name: name as! Identifier, args: args, body: body)
+    }
+
     func parseJinjaStatement() throws -> Statement {
+        // Consume {% %} tokens
         try expect(type: .openStatement, error: "Expected opening statement token")
         var result: Statement
-
         switch tokens[current].type {
         case .set:
-            current += 1
+            current += 1  // consume 'set' token
             result = try parseSetStatement()
             try expect(type: .closeStatement, error: "Expected closing statement token")
         case .if:
-            current += 1
+            current += 1  // consume 'if' token
             result = try parseIfStatement()
             try expect(type: .openStatement, error: "Expected {% token")
             try expect(type: .endIf, error: "Expected endif token")
             try expect(type: .closeStatement, error: "Expected %} token")
+        case .macro:
+            current += 1  // consume 'macro' token
+            result = try parseMacroStatement()
+            try expect(type: .openStatement, error: "Expected {% token")
+            try expect(type: .endMacro, error: "Expected endmacro token")
+            try expect(type: .closeStatement, error: "Expected %} token")
         case .for:
-            current += 1
+            current += 1  // consume 'for' token
             result = try parseForStatement()
             try expect(type: .openStatement, error: "Expected {% token")
             try expect(type: .endFor, error: "Expected endfor token")
@@ -487,17 +578,13 @@ func parse(tokens: [Token]) throws -> Program {
         default:
             throw JinjaError.syntax("Unknown statement type: \(tokens[current].type)")
         }
-
         return result
     }
 
     func parseJinjaExpression() throws -> Statement {
         try expect(type: .openExpression, error: "Expected opening expression token")
-
         let result = try parseExpression()
-
         try expect(type: .closeExpression, error: "Expected closing expression token")
-
         return result
     }
 

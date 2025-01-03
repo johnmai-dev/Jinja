@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import OrderedCollections
 
 protocol Statement {}
 
@@ -41,7 +42,7 @@ struct TupleLiteral: Literal {
 }
 
 struct ObjectLiteral: Literal {
-    var value: [(Expression, Expression)]
+    var value: OrderedDictionary<String, Expression>
 }
 
 struct Set: Statement {
@@ -49,7 +50,7 @@ struct Set: Statement {
     var value: Expression
 }
 
-struct If: Statement {
+struct If: Statement, Expression {
     var test: Expression
     var body: [Statement]
     var alternate: [Statement]
@@ -59,14 +60,14 @@ struct Identifier: Expression {
     var value: String
 }
 
-protocol Loopvar {}
-extension Identifier: Loopvar {}
-extension TupleLiteral: Loopvar {}
+typealias Loopvar = Expression
 
 struct For: Statement {
     var loopvar: Loopvar
     var iterable: Expression
     var body: [Statement]
+    var defaultBlock: [Statement]
+    var ifCondition: Expression?
 }
 
 struct MemberExpression: Expression {
@@ -92,7 +93,11 @@ extension CallExpression: Filter {}
 
 struct FilterExpression: Expression {
     var operand: Expression
-    var filter: Filter
+    var filter: Identifier
+    var args: [Expression]
+    var kwargs: [KeywordArgumentExpression]
+    var dyn_args: Expression?
+    var dyn_kwargs: Expression?
 }
 
 struct TestExpression: Expression {
@@ -123,4 +128,24 @@ struct KeywordArgumentExpression: Expression {
 
 struct NullLiteral: Literal {
     var value: Any? = nil
+}
+
+struct SelectExpression: Expression {
+    var iterable: Expression
+    var test: Expression
+}
+
+struct Macro: Statement {
+    var name: Identifier
+    var args: [Expression]
+    var body: [Statement]
+}
+
+struct KeywordArgumentsValue: RuntimeValue {
+    var value: [String: any RuntimeValue]
+    var builtins: [String: any RuntimeValue] = [:]
+
+    func bool() -> Bool {
+        !value.isEmpty
+    }
 }
