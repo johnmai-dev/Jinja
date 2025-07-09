@@ -33,6 +33,7 @@ enum TokenType: String {
 
     case callOperator = "CallOperator"
     case additiveBinaryOperator = "AdditiveBinaryOperator"
+    case concatBinaryOperator = "ConcatBinaryOperator"
     case multiplicativeBinaryOperator = "MultiplicativeBinaryOperator"
     case comparisonBinaryOperator = "ComparisonBinaryOperator"
     case unaryOperator = "UnaryOperator"
@@ -115,6 +116,7 @@ let orderedMappingTable: [(String, TokenType)] = [
     (">", .comparisonBinaryOperator),
     ("+", .additiveBinaryOperator),
     ("-", .additiveBinaryOperator),
+    ("~", .concatBinaryOperator),
     ("*", .multiplicativeBinaryOperator),
     ("/", .multiplicativeBinaryOperator),
     ("%", .multiplicativeBinaryOperator),

@@ -600,6 +600,29 @@ struct Interpreter {
                 return StringValue(value: "")
             }
 
+            // Tilde operator with undefined/null (converts to empty string)
+            if node.operation.value == "~" {
+                let leftValue: String
+                if let leftString = left as? StringValue {
+                    leftValue = leftString.value
+                } else if left is UndefinedValue {
+                    leftValue = ""
+                } else {
+                    leftValue = try stringify(left, whitespaceControl: true)
+                }
+
+                let rightValue: String
+                if let rightString = right as? StringValue {
+                    rightValue = rightString.value
+                } else if right is UndefinedValue {
+                    rightValue = ""
+                } else {
+                    rightValue = try stringify(right, whitespaceControl: true)
+                }
+
+                return StringValue(value: leftValue + rightValue)
+            }
+
             // Math operations with undefined/null
             if ["-", "*", "/", "%"].contains(node.operation.value) {
                 return NumericValue(value: 0)
@@ -771,6 +794,16 @@ struct Interpreter {
                     throw JinjaError.runtime("Unsupported right operand type for string concatenation")
                 }
                 return StringValue(value: left.value + rightValue)
+            case "~":
+                let rightValue: String
+                if let rightString = right as? StringValue {
+                    rightValue = rightString.value
+                } else if right is UndefinedValue {
+                    rightValue = ""
+                } else {
+                    rightValue = try stringify(right, whitespaceControl: true)
+                }
+                return StringValue(value: left.value + rightValue)
             case "in":
                 if let right = right as? StringValue {
                     return BooleanValue(value: right.value.contains(left.value))
@@ -821,6 +854,16 @@ struct Interpreter {
                 } else {
                     throw JinjaError.runtime("Unsupported left operand type for string concatenation")
                 }
+            } else if node.operation.value == "~" {
+                let leftValue: String
+                if let leftString = left as? StringValue {
+                    leftValue = leftString.value
+                } else if left is UndefinedValue {
+                    leftValue = ""
+                } else {
+                    leftValue = try stringify(left, whitespaceControl: true)
+                }
+                return StringValue(value: leftValue + right.value)
             }
         }
         if let left = left as? StringValue, let right = right as? ObjectValue {
@@ -835,6 +878,30 @@ struct Interpreter {
                 )
             }
         }
+
+        // Handle tilde operator for any type combination
+        if node.operation.value == "~" {
+            let leftValue: String
+            if let leftString = left as? StringValue {
+                leftValue = leftString.value
+            } else if left is UndefinedValue {
+                leftValue = ""
+            } else {
+                leftValue = try stringify(left, whitespaceControl: true)
+            }
+
+            let rightValue: String
+            if let rightString = right as? StringValue {
+                rightValue = rightString.value
+            } else if right is UndefinedValue {
+                rightValue = ""
+            } else {
+                rightValue = try stringify(right, whitespaceControl: true)
+            }
+
+            return StringValue(value: leftValue + rightValue)
+        }
+
         throw JinjaError.syntax(
             "Unknown operator '\(node.operation.value)' between \(type(of:left)) and \(type(of:right))"
         )

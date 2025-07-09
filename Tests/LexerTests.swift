@@ -49,6 +49,11 @@ final class LexerTests: XCTestCase {
         // Binary expressions
         "BINOP_EXPR": "{{ 1 % 2 }}{{ 1 < 2 }}{{ 1 > 2 }}{{ 1 >= 2 }}{{ 2 <= 2 }}{{ 2 == 2 }}{{ 2 != 3 }}{{ 2 + 3 }}",
 
+        // Tilde operator tests
+        "TILDE_CONCAT": "{{ 'Hello' ~ ' ' ~ 'World' }}",
+        "TILDE_MIXED": "{{ 'Count: ' ~ 42 ~ ' items' }}",
+        "TILDE_BOOL": "{{ true ~ ' is ' ~ false }}",
+
         // Strings
         "STRINGS": "{{ 'Bye' }}{{ bos_token + '[INST] ' }}",
         "STRINGS_1": "|{{ \"test\" }}|{{ \"a\" + 'b' + \"c\" }}|{{ '\"' + \"'\" }}|{{ '\\'' }}|{{ \"\\\"\" }}|",
@@ -703,6 +708,35 @@ final class LexerTests: XCTestCase {
             Token(value: "2", type: .numericLiteral),
             Token(value: "+", type: .additiveBinaryOperator),
             Token(value: "3", type: .numericLiteral),
+            Token(value: "}}", type: .closeExpression),
+        ],
+
+        // Tilde operator tests
+        "TILDE_CONCAT": [
+            Token(value: "{{", type: .openExpression),
+            Token(value: "Hello", type: .stringLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: " ", type: .stringLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: "World", type: .stringLiteral),
+            Token(value: "}}", type: .closeExpression),
+        ],
+        "TILDE_MIXED": [
+            Token(value: "{{", type: .openExpression),
+            Token(value: "Count: ", type: .stringLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: "42", type: .numericLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: " items", type: .stringLiteral),
+            Token(value: "}}", type: .closeExpression),
+        ],
+        "TILDE_BOOL": [
+            Token(value: "{{", type: .openExpression),
+            Token(value: "true", type: .booleanLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: " is ", type: .stringLiteral),
+            Token(value: "~", type: .concatBinaryOperator),
+            Token(value: "false", type: .booleanLiteral),
             Token(value: "}}", type: .closeExpression),
         ],
 

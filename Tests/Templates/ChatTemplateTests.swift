@@ -620,7 +620,7 @@ final class ChatTemplateTests: XCTestCase {
         XCTAssertEqual(result, target)
     }
 
-    func testDeepSeekR1WitihSystemPrompt() throws {
+    func testDeepSeekR1WithSystemPrompt() throws {
         let userMessage = [
             "role": "user",
             "content": "What is the weather in Paris today?",
@@ -700,6 +700,38 @@ final class ChatTemplateTests: XCTestCase {
             Respond to every user query in a comprehensive and detailed way. You can write down your thoughts and reasoning process before responding. In the thought process, engage in a comprehensive cycle of analysis, summarization, exploration, reassessment, reflection, backtracing, and iteration to develop well-considered thinking process. In the response section, based on various attempts, explorations, and reflections from the thoughts section, systematically present the final solution that you deem correct. The response should summarize the thought process. Write your thoughts between <think></think> and write your response between <response></response> for each user query.<|end_of_text|>
             <|start_of_role|>user<|end_of_role|>What is 1+1?<|end_of_text|>
             <|start_of_role|>assistant<|end_of_role|>
+            """
+        XCTAssertEqual(result, target)
+    }
+
+    func testSmolLM3() throws {
+        let userMessage = [
+            "role": "user",
+            "content": "What is the weather in Paris today?",
+        ]
+        let template = try Template(ChatTemplate.smollm3)
+        let result = try template.render([
+            "messages": [userMessage],
+            "add_generation_prompt": true,
+        ])
+        let target = """
+            <|im_start|>system
+            # Tools
+
+            You may call one or more functions to assist with the user query.
+
+            You are provided with function signatures within <tools></tools> XML tags:
+            <tools>
+            {"function": {"description": "Get the current weather in a given location", "name": "get_current_weather", "parameters": {"properties": {"location": {"description": "The city and state, e.g. San Francisco, CA", "type": "string"}, "unit": {"enum": ["celsius", "fahrenheit"], "type": "string"}}, "required": ["location"], "type": "object"}}, "type": "function"}
+            </tools>
+
+            For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+            <tool_call>
+            {"name": <function-name>, "arguments": <args-json-object>}
+            </tool_call><|im_end|>
+            <|im_start|>user
+            What is the weather in Paris today?<|im_end|>
+            <|im_start|>assistant
             """
         XCTAssertEqual(result, target)
     }
